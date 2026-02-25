@@ -1,0 +1,14 @@
+services:
+  docendo-sync:
+    build: .
+    container_name: docendo-sync
+    restart: unless-stopped
+    volumes:
+      # credentials.json: Google OAuth client secrets (you provide this)
+      - ./credentials.json:/app/credentials.json:ro
+      # token.json: auto-generated after first auth (persisted across restarts)
+      - ./token.json:/app/token.json
+      # sync.log: readable from host
+      - ./sync.log:/app/sync.log
+    environment:
+      - TZ=Europe/Copenhagen
