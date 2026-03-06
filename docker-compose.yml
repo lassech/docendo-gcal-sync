@@ -10,5 +10,12 @@ services:
       - ./token.json:/app/token.json
       # sync.log: readable from host
       - ./sync.log:/app/sync.log
+      # pdfs: drop new monthly PDFs here, then run pdf_sync.py
+      - ./pdfs:/app/pdfs
     environment:
       - TZ=Europe/Copenhagen
+      # Set ONE of these depending on which AI provider you use:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # AI_PROVIDER: "openai" (default) or "claude"
+      - AI_PROVIDER=${AI_PROVIDER:-openai}
