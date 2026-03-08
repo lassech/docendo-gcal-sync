@@ -8,8 +8,10 @@ import os
 import sys
 import logging
 import hashlib
+import smtplib
 import requests
 from datetime import datetime, timezone, date
+from email.mime.text import MIMEText
 from icalendar import Calendar
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -187,6 +189,33 @@ def build_google_event(docendo_ev: dict) -> dict:
     }
 
 
+# ── Email notification ────────────────────────────────────────────────────────
+def send_email(subject: str, body: str):
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.mailbox.org")
+    smtp_port = int(os.environ.get("SMTP_PORT", 587))
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pass = os.environ.get("SMTP_PASSWORD", "")
+    notify_to = os.environ.get("NOTIFY_EMAIL", "")
+
+    if not all([smtp_user, smtp_pass, notify_to]):
+        log.warning("Email not configured — skipping notification")
+        return
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = smtp_user
+    msg["To"] = notify_to
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as s:
+            s.starttls()
+            s.login(smtp_user, smtp_pass)
+            s.send_message(msg)
+        log.info("Email sendt til %s", notify_to)
+    except Exception as e:
+        log.warning("Kunne ikke sende email: %s", e)
+
+
 # ── Sync logic ────────────────────────────────────────────────────────────────
 def sync(service, docendo_events: list[dict]):
     existing = get_existing_synced_events(service)
@@ -245,18 +274,44 @@ def sync(service, docendo_events: list[dict]):
         "Sync done — created: %d, updated: %d, deleted: %d, unchanged: %d",
         created, updated, deleted, skipped,
     )
+    return created, updated, deleted, skipped
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     log.info("=== Docendo sync started ===")
+    now = datetime.now().strftime("%d/%m/%Y %H:%M")
     try:
         docendo_events = fetch_docendo_events()
         service = get_google_service()
-        sync(service, docendo_events)
+        created, updated, deleted, skipped = sync(service, docendo_events)
     except Exception as e:
         log.exception("Sync failed: %s", e)
+        send_email(
+            f"⚠️ Docendo sync fejlede — {now}",
+            f"Synkroniseringen fejlede med følgende fejl:\n\n{e}\n\nTjek sync.log for detaljer.",
+        )
         sys.exit(1)
+
+    if created or updated or deleted:
+        subject = f"📅 Docendo: {created} nye, {updated} opdateret, {deleted} slettet — {now}"
+        lines = [
+            f"Docendo-skema synket til Google Kalender ({now})",
+            "",
+            f"  Nye events:       {created}",
+            f"  Opdaterede:       {updated}",
+            f"  Slettede:         {deleted}",
+            f"  Uændrede:         {skipped}",
+        ]
+    else:
+        subject = f"✅ Docendo sync: Ingen ændringer — {now}"
+        lines = [
+            f"Docendo-skema synket til Google Kalender ({now})",
+            "",
+            f"  Ingen ændringer. {skipped} events uændrede.",
+        ]
+
+    send_email(subject, "\n".join(lines))
     log.info("=== Sync complete ===")
 
 

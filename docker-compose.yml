@@ -19,3 +19,9 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       # AI_PROVIDER: "openai" (default) or "claude"
       - AI_PROVIDER=${AI_PROVIDER:-openai}
+      # Email notifications (configured in .env)
+      - SMTP_HOST=${SMTP_HOST:-smtp.mailbox.org}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - NOTIFY_EMAIL=${NOTIFY_EMAIL:-}
