@@ -160,8 +160,8 @@ def get_google_service():
     return build("calendar", "v3", credentials=creds)
 
 
-def get_existing_pdf_events(service) -> dict[str, dict]:
-    existing = {}
+def get_existing_pdf_events_in_range(service, time_min: str, time_max: str) -> list[dict]:
+    existing = []
     page_token = None
     while True:
         result = (
@@ -169,20 +169,19 @@ def get_existing_pdf_events(service) -> dict[str, dict]:
             .list(
                 calendarId=GOOGLE_CALENDAR_ID,
                 privateExtendedProperty=f"source={SOURCE_TAG}",
+                timeMin=time_min,
+                timeMax=time_max,
                 pageToken=page_token,
                 maxResults=250,
                 singleEvents=True,
             )
             .execute()
         )
-        for ev in result.get("items", []):
-            fp = ev.get("extendedProperties", {}).get("private", {}).get("fingerprint")
-            if fp:
-                existing[fp] = ev
+        existing.extend(result.get("items", []))
         page_token = result.get("nextPageToken")
         if not page_token:
             break
-    log.info("Found %d existing PDF events in Google Calendar", len(existing))
+    log.info("Found %d existing PDF events in range %s – %s", len(existing), time_min[:10], time_max[:10])
     return existing
 
 
@@ -203,20 +202,29 @@ def build_google_event(ev: dict) -> dict:
 
 
 def sync(service, pdf_events: list[dict]):
-    existing = get_existing_pdf_events(service)
-    created = skipped = 0
+    dates = [ev["date"] for ev in pdf_events]
+    time_min = f"{min(dates)}T00:00:00Z"
+    time_max = f"{max(dates)}T23:59:59Z"
+
+    old_events = get_existing_pdf_events_in_range(service, time_min, time_max)
+    deleted = 0
+    for gev in old_events:
+        try:
+            service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=gev["id"]).execute()
+            deleted += 1
+        except HttpError as e:
+            log.warning("Failed to delete event %s: %s", gev.get("id"), e)
+    log.info("Deleted %d old PDF events in range", deleted)
+
+    created = 0
     for ev in pdf_events:
-        fp = event_fingerprint(ev)
-        if fp in existing:
-            skipped += 1
-            continue
         try:
             service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=build_google_event(ev)).execute()
             log.info("Created: %s %s-%s %s", ev["date"], ev["start_time"], ev["end_time"], ev["worker"])
             created += 1
         except HttpError as e:
             log.warning("Failed to create event: %s", e)
-    log.info("PDF sync done — created: %d, already existed: %d", created, skipped)
+    log.info("PDF sync done — deleted: %d, created: %d", deleted, created)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
