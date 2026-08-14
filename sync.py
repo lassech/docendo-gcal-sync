@@ -6,11 +6,16 @@ Fetches ICS from Docendo and syncs events to Google Calendar.
 
 import os
 import sys
+import re
+import json
+import random
+import asyncio
 import logging
 import hashlib
 import smtplib
 import requests
-from datetime import datetime, timezone, date
+import websockets
+from datetime import datetime, timedelta, timezone, date
 from email.mime.text import MIMEText
 from icalendar import Calendar
 from google.oauth2.credentials import Credentials
@@ -22,8 +27,14 @@ from googleapiclient.errors import HttpError
 # ── Configuration ────────────────────────────────────────────────────────────
 DOCENDO_ICS_URL = (
     "https://app.docendo.dk/calendars/ical/"
-    "a3ae5263-7ab9-4864-bdb3-2270efe70cec"
+    "35741f61-89c1-4f65-8dad-738cde5a9414"
 )
+# Numeric calendar id behind the public UUID above — found in the calendar page's
+# HTML as `<public-view :cal-id="485029">`. Used for the live websocket lookup
+# (see flag_discrepancies) since that API takes the numeric id, not the UUID.
+LIVE_CALENDAR_ID = 485029
+LIVE_WEBSOCKET_URL = "wss://app.docendo.dk/websocket?tz=Europe/Copenhagen"
+DISCREPANCY_WINDOW_DAYS = 14
 GOOGLE_CALENDAR_ID = "7m7qj3i33ot9m0o0r0883i3lck@group.calendar.google.com"
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), "credentials.json")
@@ -92,6 +103,119 @@ def fetch_docendo_events() -> list[dict]:
 
     log.info("Found %d events in Docendo ICS", len(events))
     return events
+
+
+# ── Live discrepancy check ──────────────────────────────────────────────────
+# The public ICS feed above is a snapshot that Docendo regenerates on its own
+# schedule — a VEVENT's DTSTAMP freezes at whenever that last happened, so
+# vikar/substitute reassignments made on the live site can be missing from the
+# ICS for a week or more. The public calendar page (app.docendo.dk/calendar/...)
+# doesn't have this lag: it queries live over a websocket. We ask that same
+# endpoint for the coming week and flag any event where the ICS's assigned
+# person doesn't match what the live site currently says.
+NICKNAME_RE = re.compile(r"\(([^()]+)\)\s*$")
+
+
+def extract_nickname(summary: str) -> str | None:
+    """Pull the trailing '(Name)' out of a Docendo summary, e.g.
+    'Kørsel, Sigurd (Johannes)' -> 'Johannes'."""
+    m = NICKNAME_RE.search(summary)
+    return m.group(1).strip() if m else None
+
+
+async def _fetch_live_events_async(calendar_id: int, start: str, end: str) -> list[dict]:
+    async with websockets.connect(LIVE_WEBSOCKET_URL, open_timeout=15) as ws:
+        await asyncio.wait_for(ws.recv(), timeout=15)  # client_connected handshake
+
+        req_id = random.randint(100000, 999999)
+        request = ["api.events.list_public", {
+            "id": req_id,
+            "data": {"calendar_id": calendar_id, "start": start, "end": end},
+        }]
+        await ws.send(json.dumps(request))
+
+        for _ in range(20):  # bail out rather than hang forever on stray frames
+            raw = await asyncio.wait_for(ws.recv(), timeout=15)
+            name, payload = json.loads(raw)[0]
+            if name == "api.events.list_public" and payload.get("id") == req_id:
+                data = payload.get("data")
+                return json.loads(data) if data else []
+        raise RuntimeError("No matching response from Docendo websocket")
+
+
+def fetch_live_events(calendar_id: int, start: str, end: str) -> list[dict]:
+    """Fetch events for a date range straight from Docendo's live public
+    websocket API — the same source the public calendar page renders from."""
+    return asyncio.run(_fetch_live_events_async(calendar_id, start, end))
+
+
+def flag_discrepancies(docendo_events: list[dict], days_ahead: int = DISCREPANCY_WINDOW_DAYS) -> int:
+    """Prefix '** ' onto the summary of any upcoming Docendo event whose
+    assigned person disagrees with what the live calendar page currently
+    shows. Mutates docendo_events in place. Returns the number flagged."""
+    now = datetime.now(timezone.utc)
+    window_end = now + timedelta(days=days_ahead)
+
+    try:
+        live_events = fetch_live_events(
+            LIVE_CALENDAR_ID,
+            now.strftime("%Y-%m-%d 00:00"),
+            window_end.strftime("%Y-%m-%d 23:59"),
+        )
+    except Exception as e:
+        log.warning("Could not reach Docendo's live calendar for discrepancy check: %s", e)
+        return 0
+
+    live_names_by_slot: dict[tuple[str, str], set[str]] = {}
+    for ev in live_events:
+        key = (ev["start"], ev["end"])
+        names = {
+            c["name"].split()[0]
+            for c in ev.get("calendars", [])
+            if c.get("calendar_type") == "user" and c.get("substitute") is None
+        }
+        live_names_by_slot.setdefault(key, set()).update(names)
+
+    flagged = 0
+    for dev in docendo_events:
+        start_dt = dev["start"].get("dateTime")
+        end_dt = dev["end"].get("dateTime")
+        if not start_dt or not end_dt:
+            continue
+        try:
+            if not (now <= datetime.fromisoformat(start_dt) <= window_end):
+                continue
+        except ValueError:
+            continue
+
+        nickname = extract_nickname(dev["summary"])
+        if not nickname:
+            continue
+
+        live_names = live_names_by_slot.get((start_dt, end_dt))
+        if live_names is None:
+            continue  # no matching live event to compare against
+
+        if nickname.lower() not in {n.lower() for n in live_names}:
+            live_str = ", ".join(sorted(live_names)) or "ingen"
+            log.info(
+                "Discrepancy flagged: %s (ICS says %s, live site says %s)",
+                dev["summary"], nickname, live_str,
+            )
+            note = (
+                f"⚠️ Muligvis forældet: Docendo's ICS-feed siger \"{nickname}\", "
+                f"men docendo.dk's kalenderside viser \"{live_str}\" lige nu. "
+                f"Tjek app.docendo.dk for den nyeste vagtplan."
+            )
+            dev["description"] = (
+                f"{note}\n\n{dev['description']}" if dev["description"] else note
+            )
+            dev["summary"] = f"** {dev['summary']}"
+            flagged += 1
+
+    if flagged:
+        log.info("Flagged %d event(s) with ICS/live discrepancies", flagged)
+    return flagged
 
 
 # ── Google Calendar ───────────────────────────────────────────────────────────
@@ -283,6 +407,7 @@ def main():
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     try:
         docendo_events = fetch_docendo_events()
+        flagged = flag_discrepancies(docendo_events)
         service = get_google_service()
         created, updated, deleted, skipped = sync(service, docendo_events)
     except Exception as e:
@@ -293,7 +418,7 @@ def main():
         )
         sys.exit(1)
 
-    if created or updated or deleted:
+    if created or updated or deleted or flagged:
         subject = f"📅 Docendo: {created} nye, {updated} opdateret, {deleted} slettet — {now}"
         lines = [
             f"Docendo-skema synket til Google Kalender ({now})",
@@ -303,6 +428,8 @@ def main():
             f"  Slettede:         {deleted}",
             f"  Uændrede:         {skipped}",
         ]
+        if flagged:
+            lines.append(f"  Markeret med **:  {flagged} (afviger fra Docendo's live side)")
     else:
         subject = f"✅ Docendo sync: Ingen ændringer — {now}"
         lines = [

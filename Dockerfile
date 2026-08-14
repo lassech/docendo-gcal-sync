@@ -13,8 +13,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy scripts
 COPY sync.py pdf_sync.py ./
 
-# Set up cron job at 06:30 (use full path since cron has minimal PATH)
-RUN echo "30 6 * * * cd /app && /usr/local/bin/python3 sync.py >> /app/sync.log 2>&1" | crontab -
+# Copy entrypoint (dumps env vars so cron can access them)
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-# Run cron in foreground
-CMD ["cron", "-f"]
+# Set up cron job at 06:30 (use full path since cron has minimal PATH)
+RUN echo "30 6 * * * . /app/env.sh && cd /app && /usr/local/bin/python3 sync.py >> /app/sync.log 2>&1" | crontab -
+
+# Run via entrypoint so env vars are available to cron
+CMD ["/entrypoint.sh"]
